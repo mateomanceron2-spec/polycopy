@@ -120,8 +120,13 @@ export class TradeMonitor extends EventEmitter {
    * Start API polling for trades
    */
   private async startApiPolling(): Promise<void> {
-    // Initialize last seen timestamp to now (only catch new trades)
-    this.lastSeenTimestamp = Math.floor(Date.now() / 1000);
+    // Initialize last seen timestamp to 5 minutes ago (catch recent trades on startup)
+    this.lastSeenTimestamp = Math.floor(Date.now() / 1000) - 300; // 5 minutes ago
+    
+    logger.info({ 
+      lookbackSeconds: 300,
+      startTime: new Date(this.lastSeenTimestamp * 1000).toISOString(),
+    }, 'Starting API polling with 5-minute lookback');
     
     // Do initial fetch to warm up
     await this.pollForTrades();

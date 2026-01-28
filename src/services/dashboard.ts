@@ -263,8 +263,10 @@ class DashboardService {
 
     if (!this.isEnabled) return;
 
-    // Clear console
-    console.clear();
+    // Only clear console if we have data to show
+    if (this.state.status === 'RUNNING') {
+      console.clear();
+    }
 
     const s = this.state;
     const modeIcon = s.mode === 'DRY-RUN' ? '🧪' : '💰';
