@@ -1,0 +1,131 @@
+version: '3.8'
+
+services:
+  copytrade-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: polymarket-copytrade
+    restart: unless-stopped
+    environment:
+      # Node Environment
+      - NODE_ENV=production
+      - LOG_LEVEL=info
+      
+      # Wallet Configuration (REQUIRED - use secrets in production)
+      - PRIVATE_KEY=${PRIVATE_KEY}
+      - TARGET_ADDRESSES=${TARGET_ADDRESSES}
+      
+      # RPC Providers (at least one required)
+      - RPC_URL_PRIMARY=${RPC_URL_PRIMARY}
+      - RPC_URL_SECONDARY=${RPC_URL_SECONDARY:-}
+      - RPC_URL_TERTIARY=${RPC_URL_TERTIARY:-}
+      - WEBSOCKET_URL=${WEBSOCKET_URL}
+      
+      # Polymarket API
+      - POLYMARKET_REST_URL=${POLYMARKET_REST_URL:-https://clob.polymarket.com}
+      - POLYMARKET_API_KEY=${POLYMARKET_API_KEY:-}
+      - POLYMARKET_API_SECRET=${POLYMARKET_API_SECRET:-}
+      - POLYMARKET_PASSPHRASE=${POLYMARKET_PASSPHRASE:-}
+      
+      # Trading Parameters
+      - TRADE_MULTIPLIER=${TRADE_MULTIPLIER:-1.0}
+      - MIN_TRADE_SIZE=${MIN_TRADE_SIZE:-1}
+      - MAX_POSITION_PERCENT=${MAX_POSITION_PERCENT:-10}
+      - MAX_SLIPPAGE_PERCENT=${MAX_SLIPPAGE_PERCENT:-2}
+      - MIN_BALANCE=${MIN_BALANCE:-100}
+      - MIN_GAS_RESERVE=${MIN_GAS_RESERVE:-0.5}
+      
+      # Safety Limits
+      - DAILY_LOSS_LIMIT=${DAILY_LOSS_LIMIT:-50}
+      - MAX_CONSECUTIVE_FAILURES=${MAX_CONSECUTIVE_FAILURES:-3}
+      - CIRCUIT_BREAKER_PAUSE_MINUTES=${CIRCUIT_BREAKER_PAUSE_MINUTES:-5}
+      
+      # Control Features
+      - DRY_RUN_MODE=${DRY_RUN_MODE:-false}
+      
+      # Redis Configuration
+      - REDIS_URL=redis://redis:6379
+      
+      # MongoDB Configuration
+      - MONGODB_URI=mongodb://mongo:27017/copytrade
+      
+      # Alerts (Optional)
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+      - DISCORD_WEBHOOK_URL=${DISCORD_WEBHOOK_URL:-}
+    
+    depends_on:
+      redis:
+        condition: service_healthy
+      mongo:
+        condition: service_healthy
+    
+    networks:
+      - copytrade-network
+    
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+    
+    # Logging
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  redis:
+    image: redis:7-alpine
+    container_name: copytrade-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 100mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis-data:/data
+    networks:
+      - copytrade-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 128M
+
+  mongo:
+    image: mongo:7
+    container_name: copytrade-mongo
+    restart: unless-stopped
+    environment:
+      - MONGO_INITDB_DATABASE=copytrade
+    volumes:
+      - mongo-data:/data/db
+    networks:
+      - copytrade-network
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+
+networks:
+  copytrade-network:
+    driver: bridge
+
+volumes:
+  redis-data:
+  mongo-data:
