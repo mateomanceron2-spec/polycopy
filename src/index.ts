@@ -14,6 +14,7 @@ import { getCircuitBreaker } from './services/circuitBreaker.js';
 import { getSafetyLimits } from './services/safetyLimits.js';
 import { getControlFeatures } from './services/controlFeatures.js';
 import { getDryRunService } from './services/dryRunService.js';
+import { getDashboard } from './services/dashboard.js';
 import type { CopyTradeSignal, HealthStatus, PerformanceMetrics } from './config/types.js';
 
 const logger = createChildLogger('Main');
@@ -33,6 +34,7 @@ class PolymarketCopyTradeBot {
   private safetyLimits = getSafetyLimits();
   private controlFeatures = getControlFeatures();
   private dryRunService = getDryRunService();
+  private dashboard = getDashboard();
 
   private isRunning = false;
   private healthCheckInterval: NodeJS.Timeout | null = null;
@@ -80,6 +82,13 @@ class PolymarketCopyTradeBot {
       logger.info('Initializing order executor...');
       await this.orderExecutor.initialize();
 
+      // Step 6.5: Start dashboard
+      this.dashboard.start(this.orderExecutor.getWalletAddress());
+      this.dashboard.updateHealth({ 
+        redis: this.cacheService.isConnected() ? 'Connected' : 'In-Memory',
+        mongo: this.databaseService.isConnectedToDb() ? 'Connected' : 'In-Memory'
+      });
+
       // Step 7: Setup trade signal handler
       this.setupSignalHandler();
       
@@ -101,12 +110,6 @@ class PolymarketCopyTradeBot {
       // Step 10: Start dry-run summary interval (if dry-run mode)
       if (this.controlFeatures.isDryRun()) {
         this.startDryRunSummaryInterval();
-        logger.info('═'.repeat(60));
-        logger.info('🧪 DRY-RUN MODE ENABLED');
-        logger.info('   No real trades will be executed');
-        logger.info('   Full validation and logging active');
-        logger.info('   Run for 24-48 hours to validate strategy');
-        logger.info('═'.repeat(60));
       }
 
       this.isRunning = true;
@@ -171,11 +174,13 @@ class PolymarketCopyTradeBot {
     this.rpcProviderManager.on('connected', (provider: string) => {
       logger.info({ provider }, 'RPC provider connected');
       this.healthMonitor.updateComponentStatus(provider, 'healthy');
+      this.dashboard.updateRpcStatus('connected', provider);
     });
 
     this.rpcProviderManager.on('disconnected', (provider: string, reason: string) => {
       logger.warn({ provider, reason }, 'RPC provider disconnected');
       this.healthMonitor.updateComponentStatus(provider, 'down');
+      this.dashboard.updateRpcStatus('disconnected', provider);
     });
 
     this.rpcProviderManager.on('failover', (from: string, to: string) => {
@@ -185,6 +190,7 @@ class PolymarketCopyTradeBot {
         'warning',
         `RPC failover: ${from} → ${to}`
       );
+      this.dashboard.updateRpcStatus('failover', to);
     });
 
     this.rpcProviderManager.on('degraded', (message: string) => {
@@ -219,6 +225,9 @@ class PolymarketCopyTradeBot {
     });
 
     this.tradeMonitor.on('signal', async (signal: CopyTradeSignal) => {
+      // Update dashboard - trade detected
+      this.dashboard.recordTradeDetected();
+      
       logger.info({
         signalId: signal.id,
         market: signal.market,
@@ -262,6 +271,17 @@ class PolymarketCopyTradeBot {
             signal,
             syntheticEvent,
             this.orderExecutor.getWalletAddress()
+          );
+          
+          // Update dashboard with simulated trade
+          this.dashboard.recordTradeExecuted(signal, true);
+          
+          // Update P&L in dashboard
+          const dryRunStats = this.dryRunService.getStats();
+          this.dashboard.updatePnL(
+            dryRunStats.totalPnL,
+            dryRunStats.unrealizedPnL,
+            dryRunStats.totalVolume
           );
           return;
         }
@@ -327,6 +347,9 @@ class PolymarketCopyTradeBot {
             signal.side,
             signal.assetId
           );
+          
+          // Update dashboard
+          this.dashboard.recordTradeExecuted(result, false);
         } else {
           // Record failure
           this.circuitBreaker.recordFailure(result.error || 'Unknown error', { signalId: signal.id });
@@ -336,6 +359,10 @@ class PolymarketCopyTradeBot {
             error: result.error,
           }, 'Trade execution failed');
           await this.alertService.alertTradeFailure(result.id, result.error || 'Unknown error');
+          
+          // Update dashboard
+          this.dashboard.recordTradeExecuted(result, false);
+          this.dashboard.recordError(result.error || 'Unknown error');
         }
       } catch (error) {
         // Record failure in circuit breaker
@@ -494,9 +521,14 @@ class PolymarketCopyTradeBot {
           matic: maticBalance.toString(),
         });
 
+        // Update dashboard
+        const usdcFormatted = (Number(usdcBalance) / 1e6).toFixed(2);
+        const maticFormatted = (Number(maticBalance) / 1e18).toFixed(4);
+        this.dashboard.updateBalances(usdcFormatted, maticFormatted);
+
         logger.debug({
-          usdc: (Number(usdcBalance) / 1e6).toFixed(2),
-          matic: (Number(maticBalance) / 1e18).toFixed(4),
+          usdc: usdcFormatted,
+          matic: maticFormatted,
         }, 'Wallet balance updated');
       } catch (error) {
         logger.error({ error }, 'Failed to update wallet balance');
@@ -568,38 +600,16 @@ class PolymarketCopyTradeBot {
    * Log startup summary
    */
   private logStartupSummary(): void {
-    const walletAddress = this.orderExecutor.getWalletAddress();
-    const blockchainStatus = this.tradeMonitor.getBlockchainStatus();
     const activeProvider = this.rpcProviderManager.getActiveProviderName();
-    const isPollingMode = this.rpcProviderManager.isInPollingMode();
-    const controlStatus = this.controlFeatures.getStatus();
     
-    logger.info('');
-    logger.info('╔════════════════════════════════════════════════════════════╗');
-    logger.info('║   POLYMARKET COPY TRADE BOT - PRODUCTION READY             ║');
-    logger.info('╠════════════════════════════════════════════════════════════╣');
-    logger.info(`║  Wallet:  ${walletAddress.slice(0, 20)}...${walletAddress.slice(-8)}           ║`);
-    logger.info(`║  Targets: ${config.wallet.targetAddresses.length} address(es) configured                     ║`);
-    logger.info(`║  Multiplier: ${config.trading.tradeMultiplier}x                                         ║`);
-    logger.info(`║  Max Position: ${config.trading.maxPositionPercent}%                                       ║`);
-    logger.info(`║  Slippage: ${config.trading.maxSlippagePercent}%                                           ║`);
-    logger.info('╠════════════════════════════════════════════════════════════╣');
-    logger.info('║  RPC PROVIDERS:                                            ║');
-    logger.info(`║    Active: ${(activeProvider || 'None').padEnd(15)} Mode: ${isPollingMode ? 'HTTP Poll' : 'WebSocket'}         ║`);
-    logger.info('║    Priority: Infura → Polygon → Alchemy                    ║');
-    logger.info('╠════════════════════════════════════════════════════════════╣');
-    logger.info('║  SAFETY FEATURES:                                          ║');
-    logger.info(`║    Daily Loss Limit: $${config.trading.dailyLossLimit.toString().padEnd(5)}                            ║`);
-    logger.info(`║    Circuit Breaker: ${config.trading.maxConsecutiveFailures} failures → ${config.trading.circuitBreakerPauseMinutes}min pause         ║`);
-    logger.info(`║    Dry-Run Mode: ${controlStatus.dryRunMode ? 'ENABLED' : 'DISABLED'}                               ║`);
-    logger.info('╠════════════════════════════════════════════════════════════╣');
-    logger.info('║  Detection: Polygon Event Logs (50-100ms latency)          ║');
-    logger.info(`║  Subscription: ${blockchainStatus.subscriptionId ? 'Active' : 'Pending'}                                      ║`);
-    logger.info('║  Cache: Ready | DB: Connected | Health: Monitoring         ║');
-    logger.info('╚════════════════════════════════════════════════════════════╝');
-    logger.info('');
-    logger.info('Monitoring OrderFilled events... Press Ctrl+C to stop.');
-    logger.info('');
+    // Update dashboard with RPC info
+    this.dashboard.updateRpcStatus('healthy', activeProvider || 'Polygon Public');
+    
+    // Just log that bot started - dashboard will show details
+    logger.info('CopyTrade bot started successfully');
+    logger.info(`Mode: ${this.controlFeatures.isDryRun() ? 'DRY-RUN' : 'LIVE'}`);
+    logger.info(`Target wallets: ${config.wallet.targetAddresses.length}`);
+    logger.info('Dashboard active - press Ctrl+C to stop');
   }
 
   /**
@@ -651,9 +661,12 @@ class PolymarketCopyTradeBot {
 
     logger.info('Stopping bot...');
     
+    // Stop dashboard and print final summary
+    this.dashboard.stop();
+    this.dashboard.printFinalSummary();
+    
     // Print dry-run summary if in dry-run mode
     if (this.controlFeatures.isDryRun()) {
-      logger.info('Printing final dry-run summary...');
       this.dryRunService.printSummary();
     }
     

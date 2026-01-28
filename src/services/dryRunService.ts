@@ -392,11 +392,22 @@ export class DryRunService extends EventEmitter {
   /**
    * Get current dry-run statistics
    */
-  getStats(): DryRunStats {
+  getStats(): DryRunStats & { totalPnL: number; unrealizedPnL: number; totalVolume: number } {
     this.stats.runDuration = Date.now() - this.stats.startTime;
+    
+    // Calculate total volume from simulated trades
+    let totalVolume = 0;
+    for (const trade of this.stats.simulatedTrades) {
+      totalVolume += trade.calculatedSize * trade.calculatedPrice;
+    }
+    
     return {
       ...this.stats,
       marketsCovered: new Set(this.stats.marketsCovered), // Clone the set
+      // Simplified P&L for dashboard
+      totalPnL: this.stats.simulatedPnL.totalUnrealizedPnL, // In dry-run, all P&L is "unrealized" until close
+      unrealizedPnL: this.stats.simulatedPnL.totalUnrealizedPnL,
+      totalVolume,
     };
   }
 
