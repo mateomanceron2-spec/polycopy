@@ -56,8 +56,18 @@ export class OrderExecutor {
       return;
     }
 
+    const isDryRun = config.trading?.dryRunMode || process.env.DRY_RUN_MODE === 'true';
+
     // Initialize nonce manager
-    await this.nonceManager.initialize();
+    try {
+      await this.nonceManager.initialize();
+    } catch (error) {
+      if (isDryRun) {
+        logger.warn('Failed to initialize nonce manager in dry-run mode, continuing...');
+      } else {
+        throw error;
+      }
+    }
 
     // Start gas optimizer
     this.gasOptimizer.startAutoUpdate();
@@ -70,12 +80,23 @@ export class OrderExecutor {
       }, 'CLOB API credentials initialized');
     } catch (error) {
       logger.error({ error }, 'Failed to initialize CLOB API credentials');
-      throw error;
+      if (!isDryRun) {
+        throw error;
+      }
+      logger.warn('Continuing in dry-run mode without CLOB credentials');
     }
 
-    // Verify USDC balance
-    const balance = await this.checkUSDCBalance();
-    logger.info({ usdcBalance: balance }, 'USDC balance checked');
+    // Verify USDC balance (skip in dry-run mode if RPC fails)
+    try {
+      const balance = await this.checkUSDCBalance();
+      logger.info({ usdcBalance: balance }, 'USDC balance checked');
+    } catch (error) {
+      if (isDryRun) {
+        logger.warn('Failed to check USDC balance in dry-run mode, using 0.0');
+      } else {
+        throw error;
+      }
+    }
 
     this.isInitialized = true;
     logger.info('Order executor initialized');
