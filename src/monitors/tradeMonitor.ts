@@ -367,7 +367,7 @@ export class TradeMonitor extends EventEmitter {
    */
   injectTestSignal(signal: CopyTradeSignal): void {
     logger.info({ 
-      market: signal.conditionId,
+      market: signal.market || signal.assetId,
       side: signal.side,
       size: signal.calculatedSize,
     }, 'Injecting test signal for dry-run testing');
