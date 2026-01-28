@@ -166,6 +166,7 @@ export class TradeMonitor extends EventEmitter {
       // Process trades in reverse order (oldest first)
       const trades = [...data.value].reverse();
       
+      let newTradesFound = 0;
       for (const trade of trades) {
         // Skip if we've already seen this trade
         if (trade.timestamp <= this.lastSeenTimestamp) {
@@ -177,6 +178,8 @@ export class TradeMonitor extends EventEmitter {
           continue;
         }
 
+        newTradesFound++;
+        
         // Mark as processed
         this.processedEvents.add(trade.transactionHash);
         this.maintainProcessedEventsSize();
@@ -186,6 +189,10 @@ export class TradeMonitor extends EventEmitter {
 
         // Process the trade
         this.handleApiTrade(trade);
+      }
+      
+      if (newTradesFound > 0) {
+        logger.info({ newTrades: newTradesFound, totalFetched: data.value.length }, 'Processed new trades from API');
       }
     } catch (error) {
       // Don't log every error, just occasionally
