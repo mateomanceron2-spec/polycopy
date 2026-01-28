@@ -7,6 +7,26 @@ import type { Trade, CopyTradeSignal, OrderFilledEvent } from '../config/types.j
 
 const logger = createChildLogger('TradeMonitor');
 
+// Polymarket Data API response types
+interface PolymarketTrade {
+  proxyWallet: string;
+  side: 'BUY' | 'SELL';
+  asset: string;
+  conditionId: string;
+  size: number;
+  price: number;
+  timestamp: number;
+  title: string;
+  slug: string;
+  outcome: string;
+  transactionHash: string;
+}
+
+interface PolymarketTradesResponse {
+  value: PolymarketTrade[];
+  Count: number;
+}
+
 export interface TradeMonitorEvents {
   signal: (signal: CopyTradeSignal) => void;
   targetTrade: (trade: Trade) => void;
@@ -26,6 +46,12 @@ export class TradeMonitor extends EventEmitter {
   private blockchainMonitor: BlockchainEventMonitor;
   private targetAddress: string;
   private isRunning = false;
+  
+  // API polling mode
+  private useApiPolling = false;
+  private pollingInterval: NodeJS.Timeout | null = null;
+  private readonly POLLING_INTERVAL_MS = 2000; // Poll every 2 seconds
+  private lastSeenTimestamp = 0;
   
   // Deduplication
   private processedEvents: Set<string> = new Set();
@@ -61,32 +87,229 @@ export class TradeMonitor extends EventEmitter {
       throw new Error('Invalid target wallet address');
     }
 
-    logger.info({ targetAddress: this.targetAddress }, 'Starting blockchain trade monitor');
-
-    // Check if we're in dry-run mode - can skip WebSocket requirement
-    const isDryRun = config.trading?.dryRunMode || process.env.DRY_RUN_MODE === 'true';
+    logger.info({ targetAddress: this.targetAddress }, 'Starting trade monitor');
     
-    // Set up blockchain event listeners
-    this.setupBlockchainListeners();
-
-    // Connect to blockchain WebSocket and subscribe to events
+    // Try WebSocket first, fall back to API polling
     try {
+      // Set up blockchain event listeners
+      this.setupBlockchainListeners();
       await this.blockchainMonitor.connect();
+      logger.info('Using WebSocket mode for real-time trade detection');
     } catch (error: any) {
-      if (isDryRun && error.message?.includes('No WebSocket RPC URL')) {
-        logger.warn('No WebSocket RPC URL configured - running in dry-run simulation mode');
-        logger.info('In dry-run mode, you can manually trigger test signals or the bot will simulate activity');
-        // Continue without WebSocket in dry-run mode
-      } else {
-        throw error;
-      }
+      logger.warn({ error: error.message }, 'WebSocket connection failed, switching to API polling mode');
+      this.useApiPolling = true;
+    }
+
+    // If WebSocket failed, start API polling
+    if (this.useApiPolling) {
+      logger.info('Starting Polymarket Data API polling mode');
+      await this.startApiPolling();
     }
 
     // Start cleanup interval
     this.startCleanupInterval();
 
     this.isRunning = true;
-    logger.info('Blockchain trade monitor started - monitoring OrderFilled events');
+    logger.info({
+      mode: this.useApiPolling ? 'API Polling' : 'WebSocket',
+      pollingInterval: this.useApiPolling ? `${this.POLLING_INTERVAL_MS}ms` : 'N/A',
+    }, 'Trade monitor started');
+  }
+
+  /**
+   * Start API polling for trades
+   */
+  private async startApiPolling(): Promise<void> {
+    // Initialize last seen timestamp to now (only catch new trades)
+    this.lastSeenTimestamp = Math.floor(Date.now() / 1000);
+    
+    // Do initial fetch to warm up
+    await this.pollForTrades();
+    
+    // Start polling interval
+    this.pollingInterval = setInterval(async () => {
+      try {
+        await this.pollForTrades();
+      } catch (error) {
+        logger.error({ error }, 'Error polling for trades');
+      }
+    }, this.POLLING_INTERVAL_MS);
+  }
+
+  /**
+   * Poll Polymarket Data API for new trades
+   */
+  private async pollForTrades(): Promise<void> {
+    try {
+      const url = `https://data-api.polymarket.com/trades?user=${this.targetAddress}&limit=20`;
+      
+      const response = await fetch(url, {
+        method: 'GET',
+        headers: { 'Accept': 'application/json' },
+      });
+
+      if (!response.ok) {
+        throw new Error(`API returned ${response.status}`);
+      }
+
+      const data = await response.json() as PolymarketTradesResponse;
+      
+      if (!data.value || data.value.length === 0) {
+        return;
+      }
+
+      // Process trades in reverse order (oldest first)
+      const trades = [...data.value].reverse();
+      
+      for (const trade of trades) {
+        // Skip if we've already seen this trade
+        if (trade.timestamp <= this.lastSeenTimestamp) {
+          continue;
+        }
+        
+        // Skip if already processed (by tx hash)
+        if (this.processedEvents.has(trade.transactionHash)) {
+          continue;
+        }
+
+        // Mark as processed
+        this.processedEvents.add(trade.transactionHash);
+        this.maintainProcessedEventsSize();
+        
+        // Update last seen
+        this.lastSeenTimestamp = Math.max(this.lastSeenTimestamp, trade.timestamp);
+
+        // Process the trade
+        this.handleApiTrade(trade);
+      }
+    } catch (error) {
+      // Don't log every error, just occasionally
+      if (Math.random() < 0.1) {
+        logger.debug({ error }, 'API poll error (occasional)');
+      }
+    }
+  }
+
+  /**
+   * Handle a trade from the API
+   */
+  private handleApiTrade(trade: PolymarketTrade): void {
+    const receiveTime = Date.now();
+    this.eventCount++;
+    this.lastEventTime = receiveTime;
+
+    // Calculate detection latency
+    const tradeTime = trade.timestamp * 1000;
+    const detectionLatency = receiveTime - tradeTime;
+    this.detectionLatencies.push(detectionLatency);
+    if (this.detectionLatencies.length > 100) {
+      this.detectionLatencies.shift();
+    }
+
+    logger.info({
+      txHash: trade.transactionHash.slice(0, 18),
+      market: trade.title,
+      side: trade.side,
+      size: trade.size,
+      price: trade.price,
+      outcome: trade.outcome,
+      latency: detectionLatency,
+    }, '🎯 TARGET TRADE DETECTED via API');
+
+    // Convert to OrderFilledEvent format
+    const event: OrderFilledEvent = {
+      orderHash: trade.transactionHash,
+      maker: this.targetAddress,
+      taker: '',
+      makerAssetId: trade.asset,
+      takerAssetId: trade.asset,
+      makerAmountFilled: (trade.size * 1e6).toString(),
+      takerAmountFilled: (trade.size * 1e6).toString(),
+      price: trade.price.toString(),
+      fee: '0',
+      side: trade.side,
+      tokenId: trade.asset,
+      transactionHash: trade.transactionHash,
+      blockNumber: 0,
+      logIndex: 0,
+      timestamp: tradeTime,
+      usdcAmount: (trade.size * trade.price * 1e6).toString(),
+      tokenAmount: (trade.size * 1e6).toString(),
+    };
+
+    // Emit raw event for dry-run processing
+    this.emit('rawEvent', event);
+
+    // Convert to Trade format
+    const tradeObj = this.convertApiTradeToTrade(trade);
+    this.emit('targetTrade', tradeObj);
+
+    // Generate signal
+    this.generateSignalFromApiTrade(trade, receiveTime);
+  }
+
+  /**
+   * Convert API trade to Trade format
+   */
+  private convertApiTradeToTrade(trade: PolymarketTrade): Trade {
+    return {
+      id: trade.transactionHash,
+      taker_order_id: trade.transactionHash,
+      market: trade.slug,
+      asset_id: trade.asset,
+      side: trade.side,
+      size: trade.size.toString(),
+      fee_rate_bps: '0',
+      price: trade.price.toString(),
+      status: 'MATCHED',
+      match_time: new Date(trade.timestamp * 1000).toISOString(),
+      last_update: new Date().toISOString(),
+      outcome: trade.outcome,
+      bucket_index: 0,
+      owner: trade.proxyWallet,
+      maker_address: trade.proxyWallet,
+      transaction_hash: trade.transactionHash,
+    };
+  }
+
+  /**
+   * Generate signal from API trade
+   */
+  private generateSignalFromApiTrade(trade: PolymarketTrade, receiveTime: number): void {
+    // Calculate position size
+    const multiplier = config.trading.tradeMultiplier;
+    const calculatedSize = trade.size * multiplier;
+
+    // Calculate price with premium
+    const pricePremium = config.trading.pricePremiumCents / 100;
+    const maxPrice = trade.side === 'BUY'
+      ? Math.min(trade.price + pricePremium, 0.99)
+      : Math.max(trade.price - pricePremium, 0.01);
+
+    const signal: CopyTradeSignal = {
+      id: uuidv4(),
+      targetTrade: this.convertApiTradeToTrade(trade),
+      market: trade.title,
+      assetId: trade.asset,
+      side: trade.side,
+      price: trade.price.toString(),
+      originalSize: trade.size.toString(),
+      calculatedSize: calculatedSize.toFixed(2),
+      maxPrice: maxPrice.toFixed(4),
+      detectedAt: receiveTime,
+      status: 'PENDING',
+    };
+
+    this.signalCount++;
+    logger.info({
+      signalId: signal.id.slice(0, 8),
+      market: trade.title.slice(0, 40),
+      side: signal.side,
+      size: signal.calculatedSize,
+      price: signal.maxPrice,
+    }, '📊 COPY SIGNAL GENERATED');
+
+    this.emit('signal', signal);
   }
 
   /**
@@ -95,6 +318,12 @@ export class TradeMonitor extends EventEmitter {
   async stop(): Promise<void> {
     if (!this.isRunning) {
       return;
+    }
+
+    // Stop API polling
+    if (this.pollingInterval) {
+      clearInterval(this.pollingInterval);
+      this.pollingInterval = null;
     }
 
     // Remove listeners
@@ -326,6 +555,7 @@ export class TradeMonitor extends EventEmitter {
     isRunning: boolean;
     blockchainStatus: string;
     lastEventTime: number;
+    mode: string;
   } {
     const latencies = this.detectionLatencies;
 
@@ -342,8 +572,9 @@ export class TradeMonitor extends EventEmitter {
       totalEventsProcessed: this.eventCount,
       signalsGenerated: this.signalCount,
       isRunning: this.isRunning,
-      blockchainStatus: this.blockchainMonitor.getConnectionStatus(),
+      blockchainStatus: this.useApiPolling ? 'API Polling' : this.blockchainMonitor.getConnectionStatus(),
       lastEventTime: this.lastEventTime,
+      mode: this.useApiPolling ? 'API Polling (2s)' : 'WebSocket',
     };
   }
 
