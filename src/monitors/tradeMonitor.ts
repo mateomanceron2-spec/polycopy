@@ -63,11 +63,24 @@ export class TradeMonitor extends EventEmitter {
 
     logger.info({ targetAddress: this.targetAddress }, 'Starting blockchain trade monitor');
 
+    // Check if we're in dry-run mode - can skip WebSocket requirement
+    const isDryRun = config.trading?.dryRunMode || process.env.DRY_RUN_MODE === 'true';
+    
     // Set up blockchain event listeners
     this.setupBlockchainListeners();
 
     // Connect to blockchain WebSocket and subscribe to events
-    await this.blockchainMonitor.connect();
+    try {
+      await this.blockchainMonitor.connect();
+    } catch (error: any) {
+      if (isDryRun && error.message?.includes('No WebSocket RPC URL')) {
+        logger.warn('No WebSocket RPC URL configured - running in dry-run simulation mode');
+        logger.info('In dry-run mode, you can manually trigger test signals or the bot will simulate activity');
+        // Continue without WebSocket in dry-run mode
+      } else {
+        throw error;
+      }
+    }
 
     // Start cleanup interval
     this.startCleanupInterval();
@@ -346,6 +359,21 @@ export class TradeMonitor extends EventEmitter {
    */
   getBlockchainStatus() {
     return this.blockchainMonitor.getStatus();
+  }
+
+  /**
+   * Inject a test signal (for dry-run mode testing)
+   * This allows manual testing without WebSocket connection
+   */
+  injectTestSignal(signal: CopyTradeSignal): void {
+    logger.info({ 
+      market: signal.conditionId,
+      side: signal.side,
+      size: signal.calculatedSize,
+    }, 'Injecting test signal for dry-run testing');
+    
+    this.signalCount++;
+    this.emit('signal', signal);
   }
 }
 
