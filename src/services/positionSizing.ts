@@ -91,6 +91,18 @@ export class PositionSizingService extends EventEmitter {
    * Update wallet balance from blockchain
    */
   async updateWalletBalance(walletAddress: string): Promise<WalletBalance> {
+    // In dry-run mode, return simulated balance
+    if (process.env.DRY_RUN_MODE === 'true') {
+      this.walletBalance = {
+        usdc: BigInt(1000 * Math.pow(10, this.USDC_DECIMALS)), // 1000 USDC
+        usdcFormatted: 1000,
+        matic: BigInt(10 * Math.pow(10, this.MATIC_DECIMALS)), // 10 MATIC
+        maticFormatted: 10,
+        lastUpdated: Date.now(),
+      };
+      return this.walletBalance;
+    }
+    
     const provider = this.rpcManager.getHttpProvider();
     
     try {
@@ -139,6 +151,19 @@ export class PositionSizingService extends EventEmitter {
    * Get current wallet balance (from cache or fetch)
    */
   async getWalletBalance(walletAddress: string): Promise<WalletBalance> {
+    // In dry-run mode, return simulated balance
+    if (process.env.DRY_RUN_MODE === 'true') {
+      const simulatedBalance = {
+        usdc: BigInt(1000 * Math.pow(10, this.USDC_DECIMALS)), // 1000 USDC
+        usdcFormatted: 1000,
+        matic: BigInt(10 * Math.pow(10, this.MATIC_DECIMALS)), // 10 MATIC
+        maticFormatted: 10,
+        lastUpdated: Date.now(),
+      };
+      this.walletBalance = simulatedBalance;
+      return simulatedBalance;
+    }
+    
     // Check if cached balance is still valid
     if (this.walletBalance && 
         Date.now() - this.walletBalance.lastUpdated < this.BALANCE_CACHE_TTL) {

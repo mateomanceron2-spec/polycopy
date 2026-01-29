@@ -258,7 +258,7 @@ export const config: Config = {
     circuitBreakerPauseMinutes: getEnvVarAsNumber('CIRCUIT_BREAKER_PAUSE_MINUTES', 5),
     
     // Cooldowns
-    marketCooldownSeconds: getEnvVarAsNumber('MARKET_COOLDOWN_SECONDS', 60),
+    marketCooldownSeconds: getEnvVarAsNumber('MARKET_COOLDOWN_SECONDS', 0),
     
     // Modes
     dryRunMode: getEnvVar('DRY_RUN_MODE', 'false') === 'true',

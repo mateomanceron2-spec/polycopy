@@ -7,7 +7,7 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "dev": "ts-node src/index.ts",
-    "watch": "tsc -w"
+    "setup": "node setup.js"
   },
   "keywords": [
     "polymarket",

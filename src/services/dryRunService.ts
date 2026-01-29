@@ -10,6 +10,7 @@
  */
 
 import { EventEmitter } from 'events';
+import WebSocket from 'ws';
 import { createChildLogger } from '../utils/logger.js';
 import config from '../config/index.js';
 import { getTradeValidator } from './tradeValidator.js';
@@ -101,16 +102,196 @@ export class DryRunService extends EventEmitter {
   
   // Stats tracking
   private stats: DryRunStats;
-  private simulatedPositions: Map<string, { entryPrice: number; size: number; side: 'BUY' | 'SELL'; timestamp: number }> = new Map();
+  private simulatedPositions: Map<string, { entryPrice: number; size: number; side: 'BUY' | 'SELL'; timestamp: number; tokenId: string }> = new Map();
   
   // Log storage
   private logEntries: DryRunLogEntry[] = [];
   private readonly MAX_LOG_ENTRIES = 10000;
   
+  // P&L history tracking
+  private pnlHistory: number[] = [];
+  
+  // WebSocket price tracking
+  private priceWs: WebSocket | null = null;
+  private subscribedTokens: Set<string> = new Set();
+  private latestPrices: Map<string, number> = new Map();
+  private wsReconnectTimer: NodeJS.Timeout | null = null;
+  
   constructor() {
     super();
     this.stats = this.initializeStats();
+    this.connectPriceWebSocket();
   }
+  
+  /**
+   * Connect to Polymarket CLOB WebSocket for live price updates
+   */
+  private connectPriceWebSocket(): void {
+    try {
+      this.priceWs = new WebSocket('wss://ws-subscriptions-clob.polymarket.com/ws/market');
+      
+      this.priceWs.on('open', () => {
+        logger.info('Connected to Polymarket CLOB WebSocket for live prices');
+        
+        // Subscribe to all current positions
+        this.resubscribeAllPositions();
+      });
+      
+      this.priceWs.on('message', (data: Buffer) => {
+        try {
+          const message = JSON.parse(data.toString());
+          this.handlePriceUpdate(message);
+        } catch (error) {
+          logger.error({ error }, 'Failed to parse WebSocket price message');
+        }
+      });
+      
+      this.priceWs.on('error', (error) => {
+        logger.error({ error: error.message }, 'WebSocket price connection error');
+      });
+      
+      this.priceWs.on('close', () => {
+        logger.warn('WebSocket price connection closed, reconnecting in 5s');
+        this.priceWs = null;
+        
+        // Reconnect after 5 seconds
+        this.wsReconnectTimer = setTimeout(() => {
+          this.connectPriceWebSocket();
+        }, 5000);
+      });
+      
+    } catch (error) {
+      logger.error({ error }, 'Failed to connect to price WebSocket');
+    }
+  }
+  
+  /**
+   * Handle incoming price update from WebSocket
+   */
+  private handlePriceUpdate(message: any): void {
+    try {
+      // Polymarket sends price updates in format: { event_type: 'price_change', asset_id: '...', price: '0.52' }
+      if (message.event_type === 'price_change' || message.market) {
+        const tokenId = message.asset_id || message.token_id || message.market;
+        const price = parseFloat(message.price || message.last || '0');
+        
+        if (tokenId && price > 0) {
+          this.latestPrices.set(tokenId, price);
+          
+          // Update P&L for positions with this token
+          this.updatePositionPnL(tokenId, price);
+        }
+      }
+    } catch (error) {
+      logger.error({ error }, 'Failed to handle price update');
+    }
+  }
+  
+  /**
+   * Update P&L for a specific position when price changes
+   */
+  private updatePositionPnL(tokenId: string, currentPrice: number): void {
+    for (const [orderId, position] of this.simulatedPositions) {
+      if (position.tokenId === tokenId) {
+        // Calculate unrealized P&L
+        let unrealizedPnL = 0;
+        if (position.side === 'BUY') {
+          unrealizedPnL = (currentPrice - position.entryPrice) * position.size;
+        } else {
+          unrealizedPnL = (position.entryPrice - currentPrice) * position.size;
+        }
+        
+        // Update log entry
+        const entry = this.logEntries.find(e => e.simulatedOrderId === orderId);
+        if (entry && entry.simulatedPnL) {
+          const oldPnL = entry.simulatedPnL.unrealizedPnL || 0;
+          entry.simulatedPnL.currentPrice = currentPrice;
+          entry.simulatedPnL.unrealizedPnL = unrealizedPnL;
+          entry.currentMarketPrice = currentPrice;
+          
+          // Update total stats
+          this.stats.simulatedPnL.totalUnrealizedPnL += (unrealizedPnL - oldPnL);
+          
+          // Take P&L snapshot every update for history
+          this.pnlHistory.push(this.stats.simulatedPnL.totalUnrealizedPnL);
+          if (this.pnlHistory.length > 100) {
+            this.pnlHistory.shift();
+          }
+          
+          // Update win/loss tracking
+          if (unrealizedPnL > 0 && oldPnL <= 0) {
+            this.stats.simulatedPnL.winningTrades++;
+            if (oldPnL < 0) this.stats.simulatedPnL.losingTrades--;
+          } else if (unrealizedPnL <= 0 && oldPnL > 0) {
+            this.stats.simulatedPnL.losingTrades++;
+            this.stats.simulatedPnL.winningTrades--;
+          }
+          
+          // Track largest win/loss
+          if (unrealizedPnL > this.stats.simulatedPnL.largestWin) {
+            this.stats.simulatedPnL.largestWin = unrealizedPnL;
+          }
+          if (unrealizedPnL < this.stats.simulatedPnL.largestLoss) {
+            this.stats.simulatedPnL.largestLoss = unrealizedPnL;
+          }
+        }
+      }
+    }
+  }
+  
+  /**
+   * Subscribe to price updates for a token
+   */
+  private subscribeToToken(tokenId: string): void {
+    if (!this.priceWs || this.priceWs.readyState !== WebSocket.OPEN) {
+      return;
+    }
+    
+    if (this.subscribedTokens.has(tokenId)) {
+      return;
+    }
+    
+    try {
+      // Subscribe to market updates for this token
+      const subscribeMsg = {
+        type: 'subscribe',
+        channel: 'market',
+        market: tokenId,
+      };
+      
+      this.priceWs.send(JSON.stringify(subscribeMsg));
+      this.subscribedTokens.add(tokenId);
+      
+      logger.info({ tokenId: tokenId.slice(0, 16) }, 'Subscribed to live prices');
+    } catch (error) {
+      logger.error({ error, tokenId }, 'Failed to subscribe to token prices');
+    }
+  }
+  
+  /**
+   * Resubscribe to all current positions after reconnect
+   */
+  private resubscribeAllPositions(): void {
+    this.subscribedTokens.clear();
+    
+    const uniqueTokens = new Set<string>();
+    for (const position of this.simulatedPositions.values()) {
+      uniqueTokens.add(position.tokenId);
+    }
+    
+    for (const tokenId of uniqueTokens) {
+      this.subscribeToToken(tokenId);
+    }
+    
+    logger.info({ count: uniqueTokens.size }, 'Resubscribed to position prices');
+  }
+  
+  /**
+   * Start simulating P&L updates with small random price movements
+   * DEPRECATED: Now using WebSocket live prices - removed
+   */
+  
+  // Deprecated price fetching function removed - now using WebSocket
 
   private initializeStats(): DryRunStats {
     return {
@@ -242,19 +423,34 @@ export class DryRunService extends EventEmitter {
       logEntry.wouldExecute = true;
       logEntry.simulatedOrderId = `dry-run-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       this.stats.wouldExecuteCount++;
+    }
+    
+    // Create simulated position for P&L tracking (ALWAYS if we have valid size)
+    // In dry-run mode, we want to see what P&L would be even for trades that validation might skip
+    if (logEntry.calculatedSize > 0) {
+      const positionId = logEntry.simulatedOrderId || `sim-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const entryPrice = logEntry.calculatedPrice || logEntry.targetPrice;
       
-      // Track simulated position for P&L
-      this.simulatedPositions.set(logEntry.simulatedOrderId, {
-        entryPrice: logEntry.calculatedPrice,
+      this.simulatedPositions.set(positionId, {
+        entryPrice: entryPrice,
         size: logEntry.calculatedSize,
         side: logEntry.side,
         timestamp: Date.now(),
+        tokenId: logEntry.tokenId,
       });
       
       logEntry.simulatedPnL = {
-        entryPrice: logEntry.calculatedPrice,
+        entryPrice: entryPrice,
         size: logEntry.calculatedSize,
       };
+      
+      // Subscribe to live price updates for this token
+      this.subscribeToToken(logEntry.tokenId);
+      
+      // Add to simulated trades list if no skip reasons
+      if (skipReasons.length === 0) {
+        this.stats.simulatedTrades.push(logEntry);
+      }
     }
 
     // Track market coverage
@@ -392,7 +588,18 @@ export class DryRunService extends EventEmitter {
   /**
    * Get current dry-run statistics
    */
-  getStats(): DryRunStats & { totalPnL: number; unrealizedPnL: number; totalVolume: number } {
+  getStats(): DryRunStats & { 
+    totalPnL: number; 
+    unrealizedPnL: number; 
+    totalVolume: number;
+    totalRealizedPnL: number;
+    totalUnrealizedPnL: number;
+    winningTrades: number;
+    losingTrades: number;
+    tradesExecuted: number;
+    tradesDetected: number;
+    openPositions: number;
+  } {
     this.stats.runDuration = Date.now() - this.stats.startTime;
     
     // Calculate total volume from simulated trades
@@ -404,10 +611,17 @@ export class DryRunService extends EventEmitter {
     return {
       ...this.stats,
       marketsCovered: new Set(this.stats.marketsCovered), // Clone the set
-      // Simplified P&L for dashboard
-      totalPnL: this.stats.simulatedPnL.totalUnrealizedPnL, // In dry-run, all P&L is "unrealized" until close
+      // P&L fields for dashboard
+      totalPnL: this.stats.simulatedPnL.totalUnrealizedPnL,
+      totalRealizedPnL: 0, // In dry-run, nothing is actually closed
+      totalUnrealizedPnL: this.stats.simulatedPnL.totalUnrealizedPnL,
       unrealizedPnL: this.stats.simulatedPnL.totalUnrealizedPnL,
       totalVolume,
+      winningTrades: this.stats.simulatedPnL.winningTrades,
+      losingTrades: this.stats.simulatedPnL.losingTrades,
+      tradesExecuted: this.stats.wouldExecuteCount,
+      tradesDetected: this.stats.totalEventsDetected,
+      openPositions: this.simulatedPositions.size,
     };
   }
 
@@ -464,6 +678,14 @@ export class DryRunService extends EventEmitter {
     this.simulatedPositions.clear();
     logger.info('Dry-run statistics reset');
   }
+  
+  /**
+   * Stop the dry-run service and cleanup
+   */
+  stop(): void {
+    logger.info('Dry-run service stopped');
+    this.destroy();
+  }
 
   /**
    * Export logs to JSON for analysis
@@ -491,6 +713,50 @@ export class DryRunService extends EventEmitter {
   }
 
   /**
+   * Get recent trades for GUI
+   */
+  getRecentTrades(limit: number = 50): any[] {
+    return this.logEntries
+      .slice(-limit)
+      .reverse()
+      .map(entry => ({
+        timestamp: entry.logTimestamp,
+        market: entry.market,
+        tokenId: entry.tokenId,
+        side: entry.side,
+        price: entry.calculatedPrice,
+        originalSize: entry.targetSize,
+        calculatedSize: entry.calculatedSize,
+        wouldExecute: entry.wouldExecute,
+        skipReason: entry.skipReason,
+      }));
+  }
+
+  /**
+   * Get open positions for GUI
+   */
+  getOpenPositions(): any[] {
+    return Array.from(this.simulatedPositions.entries()).map(([orderId, pos]) => ({
+      orderId,
+      tokenId: pos.tokenId,
+      market: '', // Will be resolved by GUI
+      side: pos.side,
+      size: pos.size,
+      entryPrice: pos.entryPrice,
+      timestamp: pos.timestamp,
+      unrealizedPnL: 0, // Real-time P&L calculation
+    }));
+  }
+
+  /**
+   * Get P&L history for charts
+   */
+  getPnLHistory(): number[] {
+    // Return real-time P&L snapshots
+    return this.pnlHistory.length > 0 ? this.pnlHistory : [0];
+  }
+
+  /**
    * Save logs to database
    */
   async saveToDatabaseAsync(): Promise<void> {
@@ -513,6 +779,25 @@ export class DryRunService extends EventEmitter {
     } catch (error) {
       logger.error({ error }, 'Failed to save dry-run logs to database');
     }
+  }
+  
+  /**
+   * Clean up resources
+   */
+  destroy(): void {
+    // Close WebSocket connection
+    if (this.priceWs) {
+      this.priceWs.close();
+      this.priceWs = null;
+    }
+    
+    // Clear reconnect timer
+    if (this.wsReconnectTimer) {
+      clearTimeout(this.wsReconnectTimer);
+      this.wsReconnectTimer = null;
+    }
+    
+    logger.info('Dry-run service destroyed');
   }
 }
 

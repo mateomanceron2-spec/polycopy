@@ -22,11 +22,6 @@ interface PolymarketTrade {
   transactionHash: string;
 }
 
-interface PolymarketTradesResponse {
-  value: PolymarketTrade[];
-  Count: number;
-}
-
 export interface TradeMonitorEvents {
   signal: (signal: CopyTradeSignal) => void;
   targetTrade: (trade: Trade) => void;
@@ -50,7 +45,7 @@ export class TradeMonitor extends EventEmitter {
   // API polling mode
   private useApiPolling = false;
   private pollingInterval: NodeJS.Timeout | null = null;
-  private readonly POLLING_INTERVAL_MS = 2000; // Poll every 2 seconds
+  private readonly POLLING_INTERVAL_MS = 1000; // 1 second for ultra-low latency
   private lastSeenTimestamp = 0;
   
   // Deduplication
@@ -146,66 +141,61 @@ export class TradeMonitor extends EventEmitter {
    */
   private async pollForTrades(): Promise<void> {
     try {
-      const url = `https://data-api.polymarket.com/trades?user=${this.targetAddress}&limit=20`;
+      // Build URL with 'after' parameter to only get new activities
+      const url = this.lastSeenTimestamp > 0
+        ? `https://data-api.polymarket.com/activity?user=${this.targetAddress}&limit=10&after=${this.lastSeenTimestamp}`
+        : `https://data-api.polymarket.com/activity?user=${this.targetAddress}&limit=10&after=${Math.floor(Date.now() / 1000) - 300}`;
       
-      const response = await fetch(url, {
-        method: 'GET',
-        headers: { 'Accept': 'application/json' },
-      });
+      const response = await fetch(url, { headers: { 'Accept': 'application/json' } });
 
-      if (!response.ok) {
-        throw new Error(`API returned ${response.status}`);
-      }
+      if (!response.ok) return; // Silently fail to reduce overhead
 
-      const data = await response.json() as PolymarketTradesResponse;
+      const data = await response.json() as any[];
       
-      if (!data.value || data.value.length === 0) {
-        return;
-      }
+      if (!data?.length) return;
 
-      // Process trades in reverse order (oldest first)
-      const trades = [...data.value].reverse();
-      
+      // Process newest first (data already in reverse chronological order from API)
       let newTradesFound = 0;
-      for (const trade of trades) {
-        // Skip if we've already seen this trade
-        if (trade.timestamp <= this.lastSeenTimestamp) {
-          continue;
-        }
+      let newestTimestamp = this.lastSeenTimestamp;
+      
+      for (let i = 0; i < data.length; i++) {
+        const trade = data[i];
+        const txHash = trade.transactionHash;
         
-        // Skip if already processed (by tx hash)
-        if (this.processedEvents.has(trade.transactionHash)) {
-          continue;
-        }
+        // Fast deduplication check
+        if (this.processedEvents.has(txHash)) continue;
 
         newTradesFound++;
+        this.processedEvents.add(txHash);
         
-        // Mark as processed
-        this.processedEvents.add(trade.transactionHash);
-        this.maintainProcessedEventsSize();
-        
-        // Update last seen
-        this.lastSeenTimestamp = Math.max(this.lastSeenTimestamp, trade.timestamp);
+        // Track newest timestamp
+        if (trade.timestamp > newestTimestamp) {
+          newestTimestamp = trade.timestamp;
+        }
 
-        // Process the trade
+        // Process immediately for minimum latency
         this.handleApiTrade(trade);
       }
       
-      if (newTradesFound > 0) {
-        logger.info({ newTrades: newTradesFound, totalFetched: data.value.length }, 'Processed new trades from API');
+      // Update timestamp once after all trades processed
+      if (newestTimestamp > this.lastSeenTimestamp) {
+        this.lastSeenTimestamp = newestTimestamp;
+      }
+      
+      // Maintain Set size (every 10 polls)
+      if (newTradesFound > 0 && this.processedEvents.size > 500) {
+        const toKeep = Array.from(this.processedEvents).slice(-250);
+        this.processedEvents = new Set(toKeep);
       }
     } catch (error) {
-      // Don't log every error, just occasionally
-      if (Math.random() < 0.1) {
-        logger.debug({ error }, 'API poll error (occasional)');
-      }
+      // Silent fail to minimize latency impact
     }
   }
 
   /**
    * Handle a trade from the API
    */
-  private handleApiTrade(trade: PolymarketTrade): void {
+  private handleApiTrade(trade: any): void {
     const receiveTime = Date.now();
     this.eventCount++;
     this.lastEventTime = receiveTime;
@@ -213,40 +203,42 @@ export class TradeMonitor extends EventEmitter {
     // Calculate detection latency
     const tradeTime = trade.timestamp * 1000;
     const detectionLatency = receiveTime - tradeTime;
-    this.detectionLatencies.push(detectionLatency);
-    if (this.detectionLatencies.length > 100) {
-      this.detectionLatencies.shift();
+    
+    // Track latency (limit array size)
+    if (this.detectionLatencies.length < 100) {
+      this.detectionLatencies.push(detectionLatency);
+    } else {
+      this.detectionLatencies[this.eventCount % 100] = detectionLatency;
     }
 
     logger.info({
-      txHash: trade.transactionHash.slice(0, 18),
-      market: trade.title,
+      txHash: trade.transactionHash.slice(0, 10),
+      market: trade.title?.slice(0, 30),
       side: trade.side,
       size: trade.size,
       price: trade.price,
-      outcome: trade.outcome,
-      latency: detectionLatency,
-    }, '🎯 TARGET TRADE DETECTED via API');
+      latency: Math.floor(detectionLatency / 1000),
+    }, '🎯 TRADE');
 
     // Convert to OrderFilledEvent format
     const event: OrderFilledEvent = {
       orderHash: trade.transactionHash,
       maker: this.targetAddress,
       taker: '',
-      makerAssetId: trade.asset,
-      takerAssetId: trade.asset,
-      makerAmountFilled: (trade.size * 1e6).toString(),
-      takerAmountFilled: (trade.size * 1e6).toString(),
-      price: trade.price.toString(),
+      makerAssetId: trade.asset || '',
+      takerAssetId: trade.asset || '',
+      makerAmountFilled: String(Math.floor((trade.size || 0) * 1e6)),
+      takerAmountFilled: String(Math.floor((trade.size || 0) * 1e6)),
+      price: String(trade.price || 0),
       fee: '0',
-      side: trade.side,
-      tokenId: trade.asset,
+      side: trade.side || 'BUY',
+      tokenId: trade.asset || '',
       transactionHash: trade.transactionHash,
       blockNumber: 0,
       logIndex: 0,
       timestamp: tradeTime,
-      usdcAmount: (trade.size * trade.price * 1e6).toString(),
-      tokenAmount: (trade.size * 1e6).toString(),
+      usdcAmount: String(Math.floor((trade.size || 0) * (trade.price || 0) * 1e6)),
+      tokenAmount: String(Math.floor((trade.size || 0) * 1e6)),
     };
 
     // Emit raw event for dry-run processing
